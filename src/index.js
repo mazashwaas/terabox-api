@@ -1,6 +1,7 @@
 const express = require("express");
+const axios = require("axios");
 const { teraFetch } = require("./terabox");
-const { isValidShareUrl, extractSurl, formatBytes } = require("./utils");
+const { isValidShareUrl, extractSurl, formatBytes, loadCookies } = require("./utils");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -22,10 +23,11 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => {
   res.json({
     name: "TeraBox Downloader API",
-    version: "1.0.0",
+    version: "2.0.0",
     status: "operational",
     endpoints: {
-      "GET /api?url=<terabox_url>": "Get direct download link",
+      "GET /api?url=<terabox_url>": "Get file info + download link",
+      "GET /download?url=<terabox_url>": "Directly stream/download the file",
       "GET /health": "Health check",
     },
     timestamp: new Date().toISOString(),
@@ -37,7 +39,16 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// Main API endpoint
+// Helper: fetch and cache terabox data
+async function getData(surl) {
+  const cached = cache.get(surl);
+  if (cached && Date.now() < cached.expiry) return cached.data;
+  const data = await teraFetch(surl);
+  cache.set(surl, { data, expiry: Date.now() + CACHE_DURATION });
+  return data;
+}
+
+// Main API endpoint - returns file info
 app.get("/api", async (req, res) => {
   const startTime = Date.now();
   const rawUrl = req.query.url;
@@ -53,46 +64,23 @@ app.get("/api", async (req, res) => {
   const targetUrl = rawUrl.trim();
 
   if (!targetUrl.startsWith("http") || !isValidShareUrl(targetUrl)) {
-    return res.status(400).json({
-      status: "error",
-      url: targetUrl,
-      message: "Invalid TeraBox share URL",
-    });
+    return res.status(400).json({ status: "error", url: targetUrl, message: "Invalid TeraBox share URL" });
   }
 
   const surl = extractSurl(targetUrl);
   if (!surl) {
-    return res.status(400).json({
-      status: "error",
-      url: targetUrl,
-      message: "Could not extract surl from URL",
-    });
+    return res.status(400).json({ status: "error", url: targetUrl, message: "Could not extract surl from URL" });
   }
 
   try {
-    let data;
-    const cached = cache.get(surl);
-
-    if (cached && Date.now() < cached.expiry) {
-      data = cached.data;
-    } else {
-      data = await teraFetch(surl);
-      cache.set(surl, { data, expiry: Date.now() + CACHE_DURATION });
-    }
-
+    const data = await getData(surl);
     const responseTime = ((Date.now() - startTime) / 1000).toFixed(3) + "s";
 
     if (data && data.error) {
-      return res.status(400).json({
-        status: "error",
-        url: targetUrl,
-        error: data.error,
-        response_time: responseTime,
-      });
+      return res.status(400).json({ status: "error", url: targetUrl, error: data.error, response_time: responseTime });
     }
 
     let filename, size, download, thumbs;
-
     if (data && data.list && data.list.length > 0) {
       const item = data.list[0];
       filename = item.server_filename;
@@ -101,21 +89,96 @@ app.get("/api", async (req, res) => {
       thumbs = item.thumbs || null;
     }
 
+    // Add proxy download link
+    const proxyDownload = `${req.protocol}://${req.get("host")}/download?url=${encodeURIComponent(targetUrl)}`;
+
     return res.json({
       status: "success",
       response_time: responseTime,
       url: targetUrl,
       ...(filename && { filename }),
       ...(size && { size }),
-      ...(download && { download }),
+      ...(download && { download }),          // original (may need cookie)
+      ...(proxyDownload && { proxy_download: proxyDownload }), // works directly!
       ...(thumbs && { thumbs }),
     });
   } catch (err) {
-    return res.status(500).json({
-      status: "error",
-      message: err.message || String(err),
-      url: targetUrl,
+    return res.status(500).json({ status: "error", message: err.message || String(err), url: targetUrl });
+  }
+});
+
+// Download proxy endpoint - streams file through server with cookie
+app.get("/download", async (req, res) => {
+  const rawUrl = req.query.url;
+
+  if (!rawUrl || !rawUrl.trim()) {
+    return res.status(400).json({ status: "error", message: "Missing url parameter" });
+  }
+
+  const targetUrl = rawUrl.trim();
+
+  if (!isValidShareUrl(targetUrl)) {
+    return res.status(400).json({ status: "error", message: "Invalid TeraBox share URL" });
+  }
+
+  const surl = extractSurl(targetUrl);
+  if (!surl) {
+    return res.status(400).json({ status: "error", message: "Could not extract surl" });
+  }
+
+  try {
+    const data = await getData(surl);
+
+    if (!data || data.error || !data.list || data.list.length === 0) {
+      return res.status(400).json({ status: "error", message: data?.error || "Could not get file info" });
+    }
+
+    const item = data.list[0];
+    const dlink = item.dlink;
+    const filename = item.server_filename || "download";
+
+    if (!dlink) {
+      return res.status(400).json({ status: "error", message: "No download link found" });
+    }
+
+    const cookies = loadCookies();
+    const ndus = cookies["ndus"];
+    const cookieString = ndus ? `ndus=${ndus}` : "";
+
+    // Stream the file from TeraBox through our server
+    const fileResponse = await axios({
+      method: "GET",
+      url: dlink,
+      responseType: "stream",
+      timeout: 30000,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/145.0.0.0 Safari/537.36",
+        "Referer": "https://www.terabox.app/",
+        ...(cookieString && { Cookie: cookieString }),
+      },
+      maxRedirects: 5,
     });
+
+    // Set response headers
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+    res.setHeader("Content-Type", fileResponse.headers["content-type"] || "application/octet-stream");
+    if (fileResponse.headers["content-length"]) {
+      res.setHeader("Content-Length", fileResponse.headers["content-length"]);
+    }
+
+    // Pipe file stream to client
+    fileResponse.data.pipe(res);
+
+    fileResponse.data.on("error", (err) => {
+      console.error("Stream error:", err.message);
+      if (!res.headersSent) res.status(500).json({ status: "error", message: "Stream failed" });
+    });
+
+  } catch (err) {
+    console.error("Download error:", err.message);
+    if (!res.headersSent) {
+      return res.status(500).json({ status: "error", message: err.message || "Download failed" });
+    }
   }
 });
 
@@ -125,5 +188,5 @@ app.use((req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`TeraBox API running on port ${PORT}`);
+  console.log(`TeraBox API v2.0 running on port ${PORT}`);
 });
