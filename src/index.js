@@ -111,7 +111,7 @@ function extractFileMeta(data) {
 
 // Helper: get stream with cache
 async function getStreams(meta) {
-  if (!meta.isVideo || !meta.fsid || !meta.shareId) return null;
+  if (!meta.isVideo || !meta.fsid) return null;
   const cacheKey = `stream_${meta.fsid}`;
   const cached = streamCache.get(cacheKey);
   if (cached && Date.now() < cached.expiry) return cached.data;
@@ -192,7 +192,7 @@ app.get("/stream", async (req, res) => {
     const meta = extractFileMeta(data);
     if (!meta) return res.status(400).json({ status: "error", message: "Could not parse file info" });
     if (!meta.isVideo) return res.status(400).json({ status: "error", message: "File is not a video" });
-    if (!meta.fsid || !meta.shareId) return res.status(400).json({ status: "error", message: "Missing stream params" });
+    if (!meta.fsid) return res.status(400).json({ status: "error", message: "Missing fsid param", debug: { fsid: meta.fsid, uk: meta.uk, shareId: meta.shareId } });
 
     const streams = await getStreams(meta);
     if (!streams) return res.status(400).json({ status: "error", message: "Could not get stream URLs" });
