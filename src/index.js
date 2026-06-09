@@ -111,16 +111,15 @@ function extractFileMeta(data) {
 
 // Helper: get stream with cache
 async function getStreams(meta) {
-  if (!meta.isVideo || !meta.fsid) return null;
+  if (!meta.isVideo || !meta.dlink) return null;
   const cacheKey = `stream_${meta.fsid}`;
   const cached = streamCache.get(cacheKey);
   if (cached && Date.now() < cached.expiry) return cached.data;
-  const streams = await getStreamUrls(meta.fsid, meta.shareId, meta.uk, meta.sign, meta.timestamp);
-  if (!streams.error) {
-    streamCache.set(cacheKey, { data: streams, expiry: Date.now() + CACHE_DURATION });
-    return streams;
-  }
-  return streams; // return error so caller can display it
+  // TeraBox streaming API restricted for public shares
+  // dlink IS the mp4 — use proxy_download as stream
+  const streams = { mp4_hd: meta.dlink, mp4_sd: null, m3u8_720: null, m3u8_480: null, m3u8_360: null, m3u8_auto: null };
+  streamCache.set(cacheKey, { data: streams, expiry: Date.now() + CACHE_DURATION });
+  return streams;
 }
 
 // /api — full info
@@ -221,7 +220,7 @@ app.get("/stream", async (req, res) => {
   }
 });
 
-// /download — proxy stream
+// /download — Range-aware proxy stream (supports seeking)
 app.get("/download", async (req, res) => {
   const rawUrl = req.query.url;
   if (!rawUrl?.trim()) return res.status(400).json({ status: "error", message: "Missing url parameter" });
@@ -241,36 +240,73 @@ app.get("/download", async (req, res) => {
     const item = data.list[0];
     const dlink = item.dlink;
     const filename = item.server_filename || "download";
+    const fileSize = item.size ? parseInt(item.size) : null;
+
     if (!dlink) return res.status(400).json({ status: "error", message: "No download link" });
 
     const cookieObj = cookieManager.getNext();
     const cookieString = cookieObj ? `ndus=${cookieObj.ndus}` : "";
+
+    // Check if client sent Range header (video seeking)
+    const rangeHeader = req.headers["range"];
+
+    const requestHeaders = {
+      "User-Agent": USER_AGENT,
+      "Referer": "https://www.terabox.app/",
+      ...(cookieString && { Cookie: cookieString }),
+      ...(rangeHeader && { Range: rangeHeader }),
+    };
 
     const fileResponse = await axios({
       method: "GET",
       url: dlink,
       responseType: "stream",
       timeout: 30000,
-      headers: {
-        "User-Agent": USER_AGENT,
-        Referer: "https://www.terabox.app/",
-        ...(cookieString && { Cookie: cookieString }),
-      },
+      headers: requestHeaders,
       maxRedirects: 5,
     });
 
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.setHeader("Content-Type", fileResponse.headers["content-type"] || "application/octet-stream");
-    if (fileResponse.headers["content-length"]) res.setHeader("Content-Length", fileResponse.headers["content-length"]);
+    const contentType = fileResponse.headers["content-type"] || "video/mp4";
+    const contentLength = fileResponse.headers["content-length"];
+    const contentRange = fileResponse.headers["content-range"];
+    const statusCode = fileResponse.status;
+
+    // Set headers for video streaming
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Accept-Ranges", "bytes"); // Tell browser seeking is supported
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+    if (contentRange) res.setHeader("Content-Range", contentRange);
+
+    // For download (not streaming), add Content-Disposition
+    if (req.query.dl === "1") {
+      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+    } else {
+      res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+    }
+
+    // 206 Partial Content for range requests, 200 for full
+    res.status(rangeHeader ? 206 : 200);
 
     fileResponse.data.pipe(res);
-    fileResponse.data.on("error", () => {
+
+    fileResponse.data.on("error", (err) => {
+      console.error("Stream error:", err.message);
       if (!res.headersSent) res.status(500).json({ status: "error", message: "Stream failed" });
     });
+
+    req.on("close", () => {
+      fileResponse.data.destroy(); // Client disconnected — stop streaming
+    });
+
   } catch (err) {
     if (!res.headersSent) res.status(500).json({ status: "error", message: err.message });
   }
 });
+
 
 // 404
 app.use((req, res) => res.status(404).json({ error: "Not Found" }));
