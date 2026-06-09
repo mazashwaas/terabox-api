@@ -13,18 +13,20 @@ async function getStreamUrls(fsid, shareId, uk, sign, timestamp) {
 
   const cookieString = `ndus=${cookieObj.ndus}`;
 
+  // Build params — shareid optional
+  const params = {
+    app_id: "250528",
+    fsid,
+    type: "M3U8_AUTO_720",
+  };
+  if (uk) params.uk = uk;
+  if (shareId) params.shareId = shareId;
+  if (sign) params.sign = sign;
+  if (timestamp) params.timestamp = timestamp;
+
   try {
-    // TeraBox video stream API
     const res = await axios.get("https://www.terabox.app/api/streaming", {
-      params: {
-        app_id: "250528",
-        fsid,
-        shareId,
-        uk,
-        sign,
-        timestamp,
-        type: "M3U8_AUTO_720",
-      },
+      params,
       headers: {
         "User-Agent": USER_AGENT,
         Referer: "https://www.terabox.app/",
@@ -37,20 +39,19 @@ async function getStreamUrls(fsid, shareId, uk, sign, timestamp) {
 
     if (data.errno !== 0) {
       cookieManager.markFailed(cookieObj.ndus);
-      return { error: `Stream API error: ${data.errmsg || data.errno}` };
+      return { error: `Stream API error: errno ${data.errno} - ${data.errmsg || "unknown"}` };
     }
 
     cookieManager.markSuccess(cookieObj.ndus);
 
-    // Extract both stream types
     const streams = data.result || {};
     return {
       m3u8_auto: streams.m3u8_auto_480 || streams.m3u8_auto_360 || null,
-      m3u8_720: streams.m3u8_auto_720 || null,
-      m3u8_480: streams.m3u8_auto_480 || null,
-      m3u8_360: streams.m3u8_auto_360 || null,
-      mp4_hd: streams.mp4_hd || null,
-      mp4_sd: streams.mp4_sd || null,
+      m3u8_720:  streams.m3u8_auto_720  || null,
+      m3u8_480:  streams.m3u8_auto_480  || null,
+      m3u8_360:  streams.m3u8_auto_360  || null,
+      mp4_hd:    streams.mp4_hd         || null,
+      mp4_sd:    streams.mp4_sd         || null,
     };
   } catch (err) {
     cookieManager.markFailed(cookieObj.ndus);
