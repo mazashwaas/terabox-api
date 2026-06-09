@@ -63,12 +63,44 @@ async function getData(surl) {
 function extractFileMeta(data) {
   if (!data || !data.list || data.list.length === 0) return null;
   const item = data.list[0];
+
+  // fid format: uk-appid-fsid  e.g. "81366184102199-250528-187071833914309"
+  let ukFromFid = null, fsidFromFid = null;
+  const fid = item.path_fid || item.fid || null;
+  if (fid) {
+    const parts = String(fid).split("-");
+    if (parts.length >= 3) {
+      ukFromFid = parts[0];
+      fsidFromFid = parts[2];
+    }
+  }
+
+  // Also try to parse from dlink fid param
+  let ukFromDlink = null, fsidFromDlink = null;
+  if (item.dlink) {
+    try {
+      const dlUrl = new URL(item.dlink);
+      const fidParam = dlUrl.searchParams.get("fid");
+      if (fidParam) {
+        const parts = fidParam.split("-");
+        if (parts.length >= 3) {
+          ukFromDlink = parts[0];
+          fsidFromDlink = parts[2];
+        }
+      }
+    } catch {}
+  }
+
+  const uk = data.uk || item.uk || ukFromFid || ukFromDlink || null;
+  const fsid = item.fs_id || fsidFromFid || fsidFromDlink || null;
+  const shareId = data.shareid || item.shareid || null;
+
   return {
     filename: item.server_filename,
     size: formatBytes(item.size),
-    fsid: item.fs_id,
-    uk: data.uk || item.uk || null,
-    shareId: data.shareid || null,
+    fsid,
+    uk,
+    shareId,
     sign: data.sign || null,
     timestamp: data.timestamp || null,
     dlink: item.dlink,
