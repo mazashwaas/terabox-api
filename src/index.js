@@ -120,7 +120,7 @@ async function getStreams(meta) {
     streamCache.set(cacheKey, { data: streams, expiry: Date.now() + CACHE_DURATION });
     return streams;
   }
-  return null;
+  return streams; // return error so caller can display it
 }
 
 // /api — full info
@@ -195,7 +195,13 @@ app.get("/stream", async (req, res) => {
     if (!meta.fsid) return res.status(400).json({ status: "error", message: "Missing fsid param", debug: { fsid: meta.fsid, uk: meta.uk, shareId: meta.shareId } });
 
     const streams = await getStreams(meta);
-    if (!streams) return res.status(400).json({ status: "error", message: "Could not get stream URLs" });
+    if (!streams || streams.error) {
+      return res.status(400).json({ 
+        status: "error", 
+        message: streams?.error || "Could not get stream URLs",
+        debug: { fsid: meta.fsid, uk: meta.uk, shareId: meta.shareId }
+      });
+    }
 
     return res.json({
       status: "success",
