@@ -1,5 +1,7 @@
 const express = require("express");
 const axios = require("axios");
+const https = require("https");
+const http = require("http");
 const { teraFetch } = require("./terabox");
 const { getStreamUrls } = require("./stream");
 const cookieManager = require("./cookieManager");
@@ -248,86 +250,60 @@ app.get("/download", async (req, res) => {
     const rangeHeader = req.headers["range"];
     const isDownload = req.query.dl === "1";
 
-    // ── STEP 1: Try HEAD request to check if dlink is directly accessible ──
-    // If TeraBox serves it without cookie (some regions/links do), redirect directly
-    // This skips Render bandwidth entirely = much faster streaming
-    if (!isDownload && !rangeHeader) {
-      try {
-        const headRes = await axios.head(dlink, {
-          timeout: 5000,
-          maxRedirects: 5,
-          headers: {
-            "User-Agent": USER_AGENT,
-            "Referer": "https://www.terabox.app/",
-            ...(cookieString && { Cookie: cookieString }),
-          },
-          validateStatus: (s) => s < 400,
-        });
-
-        // Get final URL after redirects
-        const finalUrl = headRes.request?.res?.responseUrl || headRes.config?.url || dlink;
-        const ct = headRes.headers["content-type"] || "";
-
-        if (ct.includes("video") || ct.includes("octet-stream")) {
-          // Direct redirect — browser fetches from TeraBox/CDN directly
-          res.setHeader("Access-Control-Allow-Origin", "*");
-          return res.redirect(302, finalUrl);
-        }
-      } catch {
-        // HEAD failed — fall through to proxy
-      }
-    }
-
-    // ── STEP 2: Proxy stream (fallback) ──
-    const requestHeaders = {
+    // Native https proxy — no axios overhead, direct pipe for fast streaming
+    const parsedUrl = new URL(dlink);
+    const reqHeaders = {
       "User-Agent": USER_AGENT,
       "Referer": "https://www.terabox.app/",
+      "Host": parsedUrl.hostname,
       ...(cookieString && { Cookie: cookieString }),
       ...(rangeHeader && { Range: rangeHeader }),
     };
 
-    const fileResponse = await axios({
-      method: "GET",
-      url: dlink,
-      responseType: "stream",
-      timeout: 30000,
-      headers: requestHeaders,
-      maxRedirects: 5,
-    });
-
-    const contentType = fileResponse.headers["content-type"] || "video/mp4";
-    const contentLength = fileResponse.headers["content-length"];
-    const contentRange = fileResponse.headers["content-range"];
-
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-
-    if (contentLength) res.setHeader("Content-Length", contentLength);
-    if (contentRange) res.setHeader("Content-Range", contentRange);
-
-    if (isDownload) {
-      res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
-    } else {
-      res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
+    function doStream(streamUrl, retried) {
+      const u = new URL(streamUrl);
+      const lib = u.protocol === "https:" ? https : http;
+      const pr = lib.request({ hostname: u.hostname, path: u.pathname + u.search, method: "GET", headers: reqHeaders }, (upstream) => {
+        // Follow one redirect (CDN hop)
+        if ((upstream.statusCode === 301 || upstream.statusCode === 302 || upstream.statusCode === 307) && !retried) {
+          const loc = upstream.headers["location"];
+          upstream.resume();
+          if (loc) return doStream(loc, true);
+        }
+        streamResponse(upstream, res, filename, isDownload, rangeHeader);
+      });
+      pr.on("error", (e) => { if (!res.headersSent) res.status(500).json({ status: "error", message: e.message }); });
+      pr.setTimeout(30000, () => { pr.destroy(); if (!res.headersSent) res.status(504).end(); });
+      req.on("close", () => pr.destroy());
+      pr.end();
     }
 
-    res.status(rangeHeader ? 206 : 200);
-    fileResponse.data.pipe(res);
-
-    fileResponse.data.on("error", (err) => {
-      console.error("Stream error:", err.message);
-      if (!res.headersSent) res.status(500).json({ status: "error", message: "Stream failed" });
-    });
-
-    req.on("close", () => fileResponse.data.destroy());
+    doStream(dlink, false);
 
   } catch (err) {
     if (!res.headersSent) res.status(500).json({ status: "error", message: err.message });
   }
 });
+
+// Helper: pipe upstream to client
+function streamResponse(upstream, res, filename, isDownload, rangeHeader) {
+  const ct = upstream.headers["content-type"] || "video/mp4";
+  const cl = upstream.headers["content-length"];
+  const cr = upstream.headers["content-range"];
+  res.setHeader("Content-Type", ct);
+  res.setHeader("Accept-Ranges", "bytes");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+  if (cl) res.setHeader("Content-Length", cl);
+  if (cr) res.setHeader("Content-Range", cr);
+  res.setHeader("Content-Disposition", isDownload
+    ? `attachment; filename="${encodeURIComponent(filename)}"`
+    : `inline; filename="${encodeURIComponent(filename)}"`);
+  res.status(rangeHeader ? 206 : (upstream.statusCode || 200));
+  upstream.pipe(res);
+  upstream.on("error", (e) => { if (!res.headersSent) res.status(500).end(); });
+}
 
 
 // 404
