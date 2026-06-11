@@ -240,16 +240,45 @@ app.get("/download", async (req, res) => {
     const item = data.list[0];
     const dlink = item.dlink;
     const filename = item.server_filename || "download";
-    const fileSize = item.size ? parseInt(item.size) : null;
 
     if (!dlink) return res.status(400).json({ status: "error", message: "No download link" });
 
     const cookieObj = cookieManager.getNext();
     const cookieString = cookieObj ? `ndus=${cookieObj.ndus}` : "";
-
-    // Check if client sent Range header (video seeking)
     const rangeHeader = req.headers["range"];
+    const isDownload = req.query.dl === "1";
 
+    // ── STEP 1: Try HEAD request to check if dlink is directly accessible ──
+    // If TeraBox serves it without cookie (some regions/links do), redirect directly
+    // This skips Render bandwidth entirely = much faster streaming
+    if (!isDownload && !rangeHeader) {
+      try {
+        const headRes = await axios.head(dlink, {
+          timeout: 5000,
+          maxRedirects: 5,
+          headers: {
+            "User-Agent": USER_AGENT,
+            "Referer": "https://www.terabox.app/",
+            ...(cookieString && { Cookie: cookieString }),
+          },
+          validateStatus: (s) => s < 400,
+        });
+
+        // Get final URL after redirects
+        const finalUrl = headRes.request?.res?.responseUrl || headRes.config?.url || dlink;
+        const ct = headRes.headers["content-type"] || "";
+
+        if (ct.includes("video") || ct.includes("octet-stream")) {
+          // Direct redirect — browser fetches from TeraBox/CDN directly
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          return res.redirect(302, finalUrl);
+        }
+      } catch {
+        // HEAD failed — fall through to proxy
+      }
+    }
+
+    // ── STEP 2: Proxy stream (fallback) ──
     const requestHeaders = {
       "User-Agent": USER_AGENT,
       "Referer": "https://www.terabox.app/",
@@ -269,11 +298,9 @@ app.get("/download", async (req, res) => {
     const contentType = fileResponse.headers["content-type"] || "video/mp4";
     const contentLength = fileResponse.headers["content-length"];
     const contentRange = fileResponse.headers["content-range"];
-    const statusCode = fileResponse.status;
 
-    // Set headers for video streaming
     res.setHeader("Content-Type", contentType);
-    res.setHeader("Accept-Ranges", "bytes"); // Tell browser seeking is supported
+    res.setHeader("Accept-Ranges", "bytes");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
@@ -281,16 +308,13 @@ app.get("/download", async (req, res) => {
     if (contentLength) res.setHeader("Content-Length", contentLength);
     if (contentRange) res.setHeader("Content-Range", contentRange);
 
-    // For download (not streaming), add Content-Disposition
-    if (req.query.dl === "1") {
+    if (isDownload) {
       res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
     } else {
       res.setHeader("Content-Disposition", `inline; filename="${encodeURIComponent(filename)}"`);
     }
 
-    // 206 Partial Content for range requests, 200 for full
     res.status(rangeHeader ? 206 : 200);
-
     fileResponse.data.pipe(res);
 
     fileResponse.data.on("error", (err) => {
@@ -298,9 +322,7 @@ app.get("/download", async (req, res) => {
       if (!res.headersSent) res.status(500).json({ status: "error", message: "Stream failed" });
     });
 
-    req.on("close", () => {
-      fileResponse.data.destroy(); // Client disconnected — stop streaming
-    });
+    req.on("close", () => fileResponse.data.destroy());
 
   } catch (err) {
     if (!res.headersSent) res.status(500).json({ status: "error", message: err.message });
