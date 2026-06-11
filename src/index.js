@@ -14,7 +14,7 @@ const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 // Cache
 const cache = new Map();
 const streamCache = new Map();
-const CACHE_DURATION = 2 * 60 * 60 * 1000;
+const CACHE_DURATION = 30 * 60 * 1000; // 30 min — dlink expires in 8h
 
 // CORS
 app.use((req, res, next) => {
@@ -250,60 +250,50 @@ app.get("/download", async (req, res) => {
     const rangeHeader = req.headers["range"];
     const isDownload = req.query.dl === "1";
 
-    // Native https proxy — no axios overhead, direct pipe for fast streaming
-    const parsedUrl = new URL(dlink);
-    const reqHeaders = {
-      "User-Agent": USER_AGENT,
-      "Referer": "https://www.terabox.app/",
-      "Host": parsedUrl.hostname,
-      ...(cookieString && { Cookie: cookieString }),
-      ...(rangeHeader && { Range: rangeHeader }),
-    };
+    // Axios proxy with cookie — reliable streaming
+    const axiosRes = await axios({
+      method: "GET",
+      url: dlink,
+      responseType: "stream",
+      timeout: 0, // no timeout for large files
+      maxRedirects: 10,
+      headers: {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://www.terabox.app/",
+        ...(cookieString && { Cookie: cookieString }),
+        ...(rangeHeader && { Range: rangeHeader }),
+      },
+    });
 
-    function doStream(streamUrl, retried) {
-      const u = new URL(streamUrl);
-      const lib = u.protocol === "https:" ? https : http;
-      const pr = lib.request({ hostname: u.hostname, path: u.pathname + u.search, method: "GET", headers: reqHeaders }, (upstream) => {
-        // Follow one redirect (CDN hop)
-        if ((upstream.statusCode === 301 || upstream.statusCode === 302 || upstream.statusCode === 307) && !retried) {
-          const loc = upstream.headers["location"];
-          upstream.resume();
-          if (loc) return doStream(loc, true);
-        }
-        streamResponse(upstream, res, filename, isDownload, rangeHeader);
-      });
-      pr.on("error", (e) => { if (!res.headersSent) res.status(500).json({ status: "error", message: e.message }); });
-      pr.setTimeout(30000, () => { pr.destroy(); if (!res.headersSent) res.status(504).end(); });
-      req.on("close", () => pr.destroy());
-      pr.end();
-    }
+    const ct = axiosRes.headers["content-type"] || "video/mp4";
+    const cl = axiosRes.headers["content-length"];
+    const cr = axiosRes.headers["content-range"];
 
-    doStream(dlink, false);
+    res.setHeader("Content-Type", ct);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
+    if (cl) res.setHeader("Content-Length", cl);
+    if (cr) res.setHeader("Content-Range", cr);
+    res.setHeader("Content-Disposition", isDownload
+      ? `attachment; filename="${encodeURIComponent(filename)}"`
+      : `inline; filename="${encodeURIComponent(filename)}"`);
+
+    res.status(rangeHeader ? 206 : 200);
+    axiosRes.data.pipe(res);
+
+    axiosRes.data.on("error", (e) => {
+      console.error("Stream error:", e.message);
+      if (!res.headersSent) res.status(500).end();
+    });
+
+    req.on("close", () => axiosRes.data.destroy());
 
   } catch (err) {
     if (!res.headersSent) res.status(500).json({ status: "error", message: err.message });
   }
 });
-
-// Helper: pipe upstream to client
-function streamResponse(upstream, res, filename, isDownload, rangeHeader) {
-  const ct = upstream.headers["content-type"] || "video/mp4";
-  const cl = upstream.headers["content-length"];
-  const cr = upstream.headers["content-range"];
-  res.setHeader("Content-Type", ct);
-  res.setHeader("Accept-Ranges", "bytes");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges");
-  if (cl) res.setHeader("Content-Length", cl);
-  if (cr) res.setHeader("Content-Range", cr);
-  res.setHeader("Content-Disposition", isDownload
-    ? `attachment; filename="${encodeURIComponent(filename)}"`
-    : `inline; filename="${encodeURIComponent(filename)}"`);
-  res.status(rangeHeader ? 206 : (upstream.statusCode || 200));
-  upstream.pipe(res);
-  upstream.on("error", (e) => { if (!res.headersSent) res.status(500).end(); });
-}
 
 
 // 404
